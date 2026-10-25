@@ -1,0 +1,205 @@
+%% Load data + map
+scan_struct = load('C:\Users\Önder Kul\Desktop\Engineer\Control\AMCL_optim\laser_scan.mat');
+scan_times = scan_struct.scan_times; 
+scan_array = scan_struct.scan_array;
+
+odom_poses = load('interpolated_odom.mat');
+x_poses = odom_poses.x_interp;
+y_poses = odom_poses.y_interp;
+theta_poses = odom_poses.theta_interp;
+time_idx = odom_poses.time_idx;
+ground_truths = odom_poses.ground_truths;
+
+%% ROS2 Bags Initialization
+ros2BagFolder = "C:\Users\Önder Kul\Desktop\Engineer\Control\AMCL_optim\lab_mapping\rosbags\rosbag2_2026_04_20-07_28_15";
+bagReader = ros2bagreader(ros2BagFolder);
+msgs = readMessages(bagReader);
+scanSel = select(bagReader, "Topic", "/scan");
+scanMsgs = readMessages(scanSel);
+mapSel = select(bagReader, "Topic", "/map");
+mapMsgs = readMessages(mapSel);
+mapData = mapMsgs{1};
+map = rosReadBinaryOccupancyGrid(mapData, 50);
+
+%% Load best param combination from random search
+randomSearchParams = load('C:\Users\Önder Kul\Desktop\Engineer\Control\AMCL_optim\random_search_best.mat');
+best_config = randomSearchParams.best_config;
+best_config(6) = [];
+best_config(10) = [];
+
+%% Initialize the AMCL Model
+odometryModel = odometryMotionModel;
+odometryModel.Noise = [0.1 0.1 0.1 0.2];
+rangeFinderModel = likelihoodFieldSensorModel;
+rangeFinderModel.SensorPose = [0.3 0 0];
+rangeFinderModel.RandomMeasurementWeight = 0.3;
+rangeFinderModel.ExpectedMeasurementWeight = 0.7;
+rangeFinderModel.MeasurementNoise = 0.2;
+rangeFinderModel.SensorLimits = [0.06 8.0];
+rangeFinderModel.Map = map;
+
+amcl = monteCarloLocalization;
+amcl.UseLidarScan = true;
+amcl.MotionModel = odometryModel;
+amcl.SensorModel = rangeFinderModel;
+amcl.UpdateThresholds = [0.1 0.1 0.2];
+amcl.ResamplingInterval = 1;
+amcl.ParticleLimits = [500 10000];
+
+%% Define Functions
+function [amcl] = configure_amcl(amcl, params)
+    release(amcl);
+    amcl.GlobalLocalization = true;
+    amcl.MotionModel.Noise = params(1:4, :)';
+    amcl.SensorModel.RandomMeasurementWeight = params(5, 1);
+    amcl.SensorModel.ExpectedMeasurementWeight = 1 - params(5, 1);
+    amcl.UpdateThresholds = params(6:8, :)';
+    amcl.SensorModel.MeasurementNoise = params(9);
+    amcl.ParticleLimits = [500 10000];
+end
+
+%% Simulation Error
+function [res] = simulation_error(amcl, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses)
+    rng(42);
+    pose_estimates = zeros(6, 3);
+    estimate_idx = 1;
+    
+    for i = 1:length(scan_times)
+        scanMsg = scanMsgs{i};
+        scan = rosReadLidarScan(scanMsg);
+        currOdom = [x_poses(i) y_poses(i) theta_poses(i)];
+        [~,estimatedPose,~] = amcl(currOdom, scan);
+    
+        if estimate_idx ~= 7 && i == time_idx(estimate_idx)
+            pose_estimates(estimate_idx, :) = estimatedPose(:);
+            estimate_idx = estimate_idx + 1;
+        end
+    end
+    diffs = ground_truths - pose_estimates;
+    res = diffs(:); % Turn into single column vector
+end
+%% Update AMCL parameters with the function
+amcl = configure_amcl(amcl, best_config(1:9)');
+res = simulation_error(amcl, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses);
+
+%%
+function [theta] = lma_optimization(amcl, start_params, lambda_factor, max_iters, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses)
+    configure_amcl(amcl, start_params);
+    n_params = length(start_params);
+
+    % Initial Evaluation
+    res = simulation_error(amcl, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses);
+    current_rmse = sqrt(mean(res.^2, 1));
+    theta = start_params;
+    lam = 10;
+    iteration = 0;
+
+    while iteration < max_iters
+        m_res = length(res);
+        J = zeros(m_res, n_params);
+
+        % Compute Gradients
+        for j = 1:n_params
+            theta_purturbed = theta;
+            theta_purturbed(j, 1) = theta(j, 1) + 1e-2; % Perturb the parameter
+            configure_amcl(amcl, theta_purturbed); % Update AMCL with perturbed parameters
+            res_purturbed = simulation_error(amcl, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses);
+            J(:, j) = (res_purturbed - res) / 1e-2; % Compute the gradient
+        end
+
+        JTJ = J'*J;
+        JTe = J'*res;
+
+        step_accepted = false;
+        while ~step_accepted
+            % Construct the LMA matrix: (J^T J + lambda * I)
+            % Marquardt's improvement uses diag(JTJ) instead of Identity for better scaling
+            diag_JTJ = diag(diag(JTJ));
+            
+            % Fallback to Identity if diag is exactly zero to prevent singular matrix
+            if all(diag_JTJ(:) == 0)
+                diag_JTJ = eye(n_params);
+            end
+        
+            H_lm = JTJ + lam * diag_JTJ;
+        
+            % Solve for delta theta: H_lm * delta = -JTe
+            try
+                % Clear previous warnings to cleanly catch singularity
+                lastwarn(''); 
+                
+                % mldivide (\) is MATLAB's equivalent to np.linalg.solve
+                delta_theta = H_lm \ (-JTe);
+                
+                % Force an error if MATLAB just warned about singularity or returned NaNs
+                [~, warnId] = lastwarn;
+                if strcmp(warnId, 'MATLAB:singularMatrix') || strcmp(warnId, 'MATLAB:nearlySingularMatrix') || any(isnan(delta_theta))
+                    error('Matrix is singular'); 
+                end
+            catch
+                fprintf('Singular Matrix, Skipping with lambda factor %d\n', lam);
+                % If matrix is singular, heavily damp it
+                lam = lam * lambda_factor;
+                continue;
+            end
+        
+            % Propose new parameters
+            theta_proposed = theta + delta_theta;
+            theta_proposed(1:4) = max(theta_proposed(1:4), 1e-4); % Noise cannot be <= 0
+            theta_proposed(5) = min(max(theta_proposed(5), 0.0), 1.0); % Weights bounded [0, 1]
+            theta_proposed(6:9) = max(theta_proposed(6:9), 1e-4); % Thresholds/Noise > 0
+            % Evaluate new parameters via simulation
+            fprintf('Evaluating proposed parameter vector\n');
+            
+            configure_amcl(amcl, theta_proposed);
+            res_proposed = simulation_error(amcl, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses);
+            proposed_rmse = sqrt(mean(res_proposed.^2));
+        
+            % 4. Evaluate Step
+            if proposed_rmse < current_rmse
+                % SUCCESS: Step is good.
+                rmse_change = current_rmse - proposed_rmse;
+        
+                theta = theta_proposed;
+                res = res_proposed;
+                current_rmse = proposed_rmse;
+                lam = lam / lambda_factor;  % Decrease damping (lean towards Gauss-Newton)
+                step_accepted = true;
+                iteration = iteration + 1;
+        
+                fprintf('Iter %d | RMSE: %.4f | Lambda: %.2e\n', iteration, current_rmse, lam);
+        
+                % Check convergence
+                if rmse_change < 1e-3
+                    fprintf('Converged: RMSE improvement below tolerance.\n');
+                    return; % Exits, assuming theta is your function return variable
+                end
+            else
+                % REJECT: Step made things worse.
+                % Increase damping (lean towards small gradient descent step) and try again
+                lam = lam * lambda_factor;
+        
+                % Failsafe to prevent infinite loops if lambda gets astronomically high
+                if lam > 1e10
+                    fprintf('Lambda too large, terminating early.\n');
+                    return; 
+                end
+            end
+        end
+
+    end
+end
+
+%% Search Params using Levenberg Marquardt Algorithm
+init_params = best_config';
+theta = lma_optimization(amcl, init_params, 2, 3, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses);
+
+%% Evaluate AMCL on the optimized parameter values
+configure_amcl(amcl, theta);
+res = simulation_error(amcl, scanMsgs, scan_times, time_idx, ground_truths, x_poses, y_poses, theta_poses);
+res = reshape(res, 6, 3);
+res = mean(abs(res), 1);
+theta_rslma = theta;
+
+%% Perform LMA starting with default ROS2 parameter values
+start_params = [0.1 0. 0.1 0.2 0.5 ]
